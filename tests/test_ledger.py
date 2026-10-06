@@ -459,6 +459,7 @@ def test_empty_account_returns_zero_balance():
         "outstanding_yuan": 0.0,
         "credit_yuan": 0.0,
         "total_received_yuan": 0.0,
+        "total_refunded_yuan": 0.0,
         "entries": [],
     }
 

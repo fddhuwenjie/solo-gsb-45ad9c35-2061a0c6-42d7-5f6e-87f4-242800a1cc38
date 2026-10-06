@@ -940,11 +940,14 @@ class LedgerDetailResponse(BaseModel):
     )
     credit_yuan: float = Field(
         default=0.0,
-        description="账户信用：应退抵减完尚未付清正额凭证后的剩余应退（≥0）；"
-        "随后来入账的应补/应退凭证重算，允许显示信用"
+        description="账户信用：应退抵减完尚未付清正额凭证、并扣除已付退款后的"
+        "剩余应退（≥0）；随后来入账的应补/应退凭证与退付重算，允许显示信用"
     )
     total_received_yuan: float = Field(
         default=0.0, description="账户累计已登记收款（逐凭证核销现金之和，≥0）"
+    )
+    total_refunded_yuan: float = Field(
+        default=0.0, description="账户累计已退付（已实际支付的退款之和，≥0）"
     )
     entries: List[LedgerEntryResponse] = Field(
         description="全部已记明细，按入账次序（entry_no 升序）；金额/计费栏/余额快照"
@@ -1054,10 +1057,106 @@ class PaymentListResponse(BaseModel):
     total_received_yuan: float = Field(
         description="当前账户累计实收（全部收款金额之和，随新增收款增长）"
     )
+    total_refunded_yuan: float = Field(
+        default=0.0, description="当前账户累计已退付（已实际支付的退款之和）"
+    )
     outstanding_yuan: float = Field(
         description="当前最新尚欠（随后续入账的应补/应退凭证变化；补退不改旧分配）"
     )
-    credit_yuan: float = Field(description="当前账户信用（允许为正）")
+    credit_yuan: float = Field(
+        description="当前账户信用（允许为正；已扣除全部已付退款）"
+    )
     payments: List[PaymentListItem] = Field(
         description="全部收款记录，按收款次序（payment_seq 升序）；内容为首次冻结值"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 账户退付：唯一退付单号 + 正金额，从应退抵减后的当前信用中实际支付
+# ---------------------------------------------------------------------------
+
+MAX_REFUND_NO_LEN = 128
+
+
+class RefundRequest(BaseModel):
+    """按账户登记一笔退付：全平台唯一退付单号与正金额。
+
+    账户 ID 由路径 /accounts/{account_id}/refunds 给出。
+    """
+
+    refund_no: str = Field(
+        min_length=1,
+        max_length=MAX_REFUND_NO_LEN,
+        description="调用方退付单号（全平台唯一）：同号 + 同账户 + 同金额重试返回"
+        "首次回执；同号换金额或跨账户使用返回 409 冲突",
+    )
+    amount_yuan: float = Field(
+        gt=0.0,
+        description="退付金额（元，必须为正且有限）；超过当前信用整笔拒绝、不留记录",
+    )
+
+
+class RefundReceiptResponse(BaseModel):
+    """一笔退付的登记回执：首次 result=paid，原样重试 result=deduped。
+
+    重试返回的始终是首次成功时冻结的内容（退付金额、时间与退付后头寸快照），
+    即使后来又入账新的应补/应退凭证或登记新收款也不漂移。
+    """
+
+    account_id: str
+    refund_no: str
+    result: Literal["paid", "deduped"] = Field(
+        description="paid=本次新登记并原子落盘；deduped=同号同账户同金额重试，"
+        "原样返回首次回执"
+    )
+    amount_yuan: float = Field(description="本次退付金额（正）")
+    paid_at: str = Field(description="首次退付时间（UTC ISO 8601，重试不漂移）")
+    outstanding_yuan: float = Field(
+        description="本次退付后的最新尚欠（应退抵减后全部正额凭证未付清余额，≥0）"
+    )
+    credit_yuan: float = Field(
+        description="本次退付后的账户信用（抵减并扣除已付退款后的剩余应退，≥0，"
+        "与尚欠不同时为正）"
+    )
+    total_refunded_yuan: float = Field(
+        description="本次退付后账户累计已付退款（含本笔）；重试时为首次退付当时的快照"
+    )
+    refund_count: int = Field(description="本次退付后账户累计退付笔数（含本笔）")
+
+
+class RefundListItem(BaseModel):
+    """退付记录列表中的一条：落盘时冻结的首付回执（列表中 result 恒为 paid）。"""
+
+    account_id: str
+    refund_no: str
+    result: Literal["paid"] = Field(
+        description="列表只反映落盘事实：每条都是首次成功的退付；"
+        "是否重试请在提交接口看 result=deduped"
+    )
+    amount_yuan: float
+    paid_at: str
+    outstanding_yuan: float = Field(description="该笔退付当时的尚欠快照")
+    credit_yuan: float = Field(description="该笔退付当时的信用快照（退付后）")
+    total_refunded_yuan: float = Field(
+        description="该笔退付当时的账户累计已付退款快照（后续退付不回改）"
+    )
+    refund_count: int = Field(description="该笔在账户内的退付序号（1 起）")
+
+
+class RefundListResponse(BaseModel):
+    """按退付次序查询账户全部退付记录与当前最新尚欠/信用。"""
+
+    account_id: str
+    refund_count: int = Field(description="账户累计退付笔数")
+    total_refunded_yuan: float = Field(
+        description="当前账户累计已付退款（全部退付金额之和，随新增退付增长）"
+    )
+    outstanding_yuan: float = Field(
+        description="当前最新尚欠（随后续入账的应补/应退凭证变化；补退不改旧退付）"
+    )
+    credit_yuan: float = Field(
+        description="当前账户信用（允许为正；已扣除全部已付退款）"
+    )
+    refunds: List[RefundListItem] = Field(
+        description="全部退付记录，按退付次序（refund_seq 升序）；内容为首次冻结值"
     )

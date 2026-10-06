@@ -20,6 +20,9 @@ from app.models import (
     PaymentListResponse,
     PaymentReceiptResponse,
     PaymentRequest,
+    RefundListResponse,
+    RefundReceiptResponse,
+    RefundRequest,
     ReplanRequest,
     ReplanResponse,
     RevisionCreateRequest,
@@ -37,6 +40,7 @@ from app.models import (
     VoucherListResponse,
 )
 from app.payments import PaymentError, ledger_detail_with_position, list_payments, submit_payment
+from app.refunds import RefundError, list_refunds, submit_refund
 from app.replan import ReplanError, execute_replan
 from app.revisions import RevisionError, get_revision, submit_revision
 from app.sessions import SessionError, append_batch, create_session, get_session, list_sessions
@@ -85,8 +89,17 @@ app = FastAPI(
         "单号换金额或跨账户使用返回 409；后续补退不改写旧收款分配，"
         "最新尚欠随凭证变化、允许显示信用；收款核对与落盘和原入账共用"
         "同一 SQLite 写事务，并发与重启后都不会重复核销。"
+        "/accounts/{账户ID}/refunds 把应退凭证形成的账户信用实际退付："
+        "按账户提交全平台唯一退付单号 + 正金额，只能支付当前应退抵减"
+        "未付凭证后剩余的信用，信用不足整笔拒绝且不留记录；退付后台账与"
+        "收款查询的当前信用立即扣除已付退款，后续入账的应补/应退仍按原"
+        "规则改变最新尚欠与信用，已记凭证、收款分配与首次回执保持原样；"
+        "返回退付金额、时间与退付后的头寸，并提供按退付次序查询记录的"
+        "接口；同单号同账户同金额重试返回首次回执，换账户或金额返回 409；"
+        "信用核对与退付登记和原入账、收款共用同一 SQLite 写事务，"
+        "并发不重复支付，重启后记录仍可查。"
     ),
-    version="1.9.0",
+    version="1.10.0",
 )
 
 
@@ -175,6 +188,17 @@ async def ledger_error_handler(request: Request, exc: LedgerError):
 async def payment_error_handler(request: Request, exc: PaymentError):
     body = {"error": exc.code, "reason": str(exc)}
     # 附加字段（如冲突单号的已登记账户/金额、超额时的当前尚欠/信用）随错误体顶层返回
+    body.update(exc.extra)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=body,
+    )
+
+
+@app.exception_handler(RefundError)
+async def refund_error_handler(request: Request, exc: RefundError):
+    body = {"error": exc.code, "reason": str(exc)}
+    # 附加字段（如冲突单号的已登记账户/金额、信用不足时的当前尚欠/信用）随错误体顶层返回
     body.update(exc.extra)
     return JSONResponse(
         status_code=exc.status_code,
@@ -569,3 +593,63 @@ async def list_account_payments(account_id: str) -> PaymentListResponse:
     """
     result = list_payments(account_id)
     return PaymentListResponse.model_validate(result)
+
+
+# ---------------------------------------------------------------------------
+# 账户退付：把应退抵减后的当前信用按退付单实际支付
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/accounts/{account_id}/refunds",
+    response_model=RefundReceiptResponse,
+    responses={
+        409: {"model": ErrorResponse, "description": "退付单号已用于别的账户或别的金额"},
+        422: {"model": ErrorResponse, "description": "金额非正或退付超过当前信用（整笔拒绝不留记录）"},
+    },
+    tags=["ledger"],
+)
+async def post_account_refund(account_id: str, req: RefundRequest) -> RefundReceiptResponse:
+    """按账户登记一笔退付，把应退凭证形成的信用实际支付给调用方。
+
+    - 可退付上限为账户**当前信用**：已记应退凭证按原入账顺序抵减尚未付清的
+      正额凭证、并扣除已落盘退付后的剩余应退（credit_yuan）；退付金额超过
+      当前信用 → 422 refund_exceeds_credit，错误体附当前尚欠/信用，
+      **整笔拒绝、不登记退付单、不留任何记录**；金额必须为正（0 / 负数 →
+      422 invalid_input）；
+    - 退付成功后，台账与收款查询的当前信用立即扣除已付退款（重算头寸时
+      已付退款先从应退池划走，剩余池子再按原规则抵减）；后续入账的
+      应补/应退仍按原规则改变最新尚欠与信用，已记凭证、收款分配与
+      首次回执保持原样；
+    - 同一 refund_no + 同账户 + 同金额重试 → result=deduped，返回首次成功时
+      冻结的回执（金额、时间与退付后头寸快照都不随后续新入账的应补/应退
+      凭证漂移）；同一单号换金额或跨账户使用 → 409 refund_no_conflict，
+      错误体附已登记的 account_id / amount_yuan，不写入；
+    - 信用核对、退付登记与落盘和原凭证入账、收款共用同一 SQLite 写事务
+      （RLock + BEGIN IMMEDIATE），refund_no 主键兜底：并发同单号只有一笔
+      落盘、并发不同单号串行核对信用不会重复支付，进程重启后记录仍在。
+    """
+    result = submit_refund(
+        account_id=account_id,
+        refund_no=req.refund_no,
+        amount_yuan=req.amount_yuan,
+    )
+    return RefundReceiptResponse.model_validate(result)
+
+
+@app.get(
+    "/accounts/{account_id}/refunds",
+    response_model=RefundListResponse,
+    tags=["ledger"],
+)
+async def list_account_refunds(account_id: str) -> RefundListResponse:
+    """按退付次序（refund_seq 升序）查询账户全部退付记录与当前最新头寸。
+
+    每条记录均为首次成功时冻结的回执（退付金额、时间与退付后头寸快照）；
+    账户级 total_refunded_yuan 为当前累计已付退款，outstanding_yuan /
+    credit_yuan 为按当前全部凭证、已落盘核销与已付退款重算的最新值
+    （后续补退会改变它们，但不改写任何历史退付记录）。从未入账也无退付的
+    账户返回全 0/空。
+    """
+    result = list_refunds(account_id)
+    return RefundListResponse.model_validate(result)

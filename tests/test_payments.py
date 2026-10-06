@@ -616,6 +616,7 @@ def test_payment_list_order_and_frozen_content_vs_latest_totals():
         "account_id": "never-used",
         "payment_count": 0,
         "total_received_yuan": 0.0,
+        "total_refunded_yuan": 0.0,
         "outstanding_yuan": 0.0,
         "credit_yuan": 0.0,
         "payments": [],

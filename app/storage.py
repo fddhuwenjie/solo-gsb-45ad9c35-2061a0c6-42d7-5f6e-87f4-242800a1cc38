@@ -35,11 +35,18 @@
   account_payment_allocations 记录每笔收款按原入账顺序对正额凭证的逐笔
   核销（含部分付清），同一写事务内与收款主行一起落盘，使「当前尚欠」
   可由已入账凭证与已落盘核销重算；超额收款整笔拒绝时两表都不写。
+- account_refund_payouts 为账户退付登记：refund_no 为调用方提交的全平台
+  唯一退付单号（主键），整行冻结首次成功时的完整回执 JSON（含退付金额、
+  退付时间与退付后的尚欠/信用/累计已付退款快照）；同一单号 + 同账户 +
+  同金额重试原样取回首付回执，单号换金额或跨账户复用按主键冲突外显式
+  判 409；(account_id, refund_seq) 唯一键保证账户内退付次序连续。
+  已付退款在重算头寸时先从应退池扣除（与现金核销受保护同构），使台账与
+  收款查询的当前信用随退付下降；信用不足时整笔拒绝，本表不写。
 - 旧库只有 sessions / session_records 两张表时，session_batches、
   session_revisions、session_settlement_vouchers、account_ledger_entries、
-  account_payments 与 account_payment_allocations 由 CREATE TABLE IF NOT
-  EXISTS 自动补齐（空表）：查询与从 next_index 续报不受影响；已确认区间
-  内没有批次边界可核对，不按前缀猜测去重。
+  account_payments、account_payment_allocations 与 account_refund_payouts
+  由 CREATE TABLE IF NOT EXISTS 自动补齐（空表）：查询与从 next_index
+  续报不受影响；已确认区间内没有批次边界可核对，不按前缀猜测去重。
 """
 
 from __future__ import annotations
@@ -160,6 +167,19 @@ CREATE TABLE IF NOT EXISTS account_payment_allocations (
 );
 CREATE INDEX IF NOT EXISTS idx_allocations_voucher
     ON account_payment_allocations(account_id, session_id, voucher_no);
+CREATE TABLE IF NOT EXISTS account_refund_payouts (
+    payout_id TEXT NOT NULL,
+    refund_no TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    refund_seq INTEGER NOT NULL,
+    amount_yuan REAL NOT NULL,
+    receipt_json TEXT NOT NULL,
+    paid_at TEXT NOT NULL,
+    PRIMARY KEY (refund_no),
+    UNIQUE (account_id, refund_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_refund_payouts_account_order
+    ON account_refund_payouts(account_id, refund_seq);
 """
 
 # 台账表后加列时的轻量迁移：旧库已建表但缺列，按列名幂等 ALTER 补齐。
@@ -731,6 +751,77 @@ class SessionStore:
             (account_id, session_id, voucher_no),
         ).fetchone()
         return float(row["s"])
+
+    # ------------------------------------------------------------------
+    # 账户退付（退付单幂等 + 信用扣减）
+    # ------------------------------------------------------------------
+
+    def get_refund_payout(
+        self, conn: sqlite3.Connection, refund_no: str
+    ) -> Optional[sqlite3.Row]:
+        """写事务内按全平台唯一退付单号取退付行；从未提交过返回 None。"""
+        return conn.execute(
+            "SELECT * FROM account_refund_payouts WHERE refund_no = ?",
+            (refund_no,),
+        ).fetchone()
+
+    def count_refund_payouts(self, conn: sqlite3.Connection, account_id: str) -> int:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM account_refund_payouts WHERE account_id = ?",
+            (account_id,),
+        ).fetchone()
+        return int(row["c"])
+
+    def sum_refund_payouts(self, conn: sqlite3.Connection, account_id: str) -> float:
+        """写事务内汇总账户全部已落盘退付金额（用于从应退池扣除已付退款）。"""
+        row = conn.execute(
+            "SELECT COALESCE(SUM(amount_yuan), 0.0) AS s"
+            " FROM account_refund_payouts WHERE account_id = ?",
+            (account_id,),
+        ).fetchone()
+        return float(row["s"])
+
+    def insert_refund_payout(
+        self,
+        conn: sqlite3.Connection,
+        payout_id: str,
+        refund_no: str,
+        account_id: str,
+        refund_seq: int,
+        amount_yuan: float,
+        receipt_json: str,
+        paid_at: str,
+    ) -> None:
+        """与「信用核对 → 退付登记」同一事务原子落盘退付主行（含冻结回执）。
+
+        refund_no 主键在数据库层兜底：并发同单号只有一笔成功落盘。
+        """
+        conn.execute(
+            "INSERT INTO account_refund_payouts"
+            "(payout_id, refund_no, account_id, refund_seq, amount_yuan,"
+            " receipt_json, paid_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                payout_id,
+                refund_no,
+                account_id,
+                refund_seq,
+                amount_yuan,
+                receipt_json,
+                paid_at,
+            ),
+        )
+
+    def list_refund_payout_rows(self, account_id: str) -> List[sqlite3.Row]:
+        """按退付次序（refund_seq 升序）列出账户全部已落盘退付行。"""
+        with self._lock, self._connect() as conn:
+            return list(
+                conn.execute(
+                    "SELECT * FROM account_refund_payouts"
+                    " WHERE account_id = ? ORDER BY refund_seq",
+                    (account_id,),
+                ).fetchall()
+            )
 
 
 _store: Optional[SessionStore] = None
