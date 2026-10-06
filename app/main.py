@@ -20,6 +20,9 @@ from app.models import (
     PaymentListResponse,
     PaymentReceiptResponse,
     PaymentRequest,
+    PayoutListResponse,
+    PayoutReceiptResponse,
+    PayoutRequest,
     ReplanRequest,
     ReplanResponse,
     RevisionCreateRequest,
@@ -37,6 +40,7 @@ from app.models import (
     VoucherListResponse,
 )
 from app.payments import PaymentError, ledger_detail_with_position, list_payments, submit_payment
+from app.payouts import PayoutError, list_payouts, submit_payout
 from app.replan import ReplanError, execute_replan
 from app.revisions import RevisionError, get_revision, submit_revision
 from app.sessions import SessionError, append_batch, create_session, get_session, list_sessions
@@ -85,8 +89,17 @@ app = FastAPI(
         "单号换金额或跨账户使用返回 409；后续补退不改写旧收款分配，"
         "最新尚欠随凭证变化、允许显示信用；收款核对与落盘和原入账共用"
         "同一 SQLite 写事务，并发与重启后都不会重复核销。"
+        "/accounts/{账户ID}/payouts 把应退抵减未付凭证后剩余的账户信用"
+        "实际退付：按账户提交全平台唯一退付单号 + 正金额，只能支付当前"
+        "信用，信用不足整笔拒绝且不留记录；退付后台账与收款查询的当前"
+        "信用同步扣除已付退款，后续入账的应补/应退仍按原规则改变最新"
+        "尚欠与信用，已记凭证、收款分配与首次回执保持原样；返回退付"
+        "金额、时间与退付后头寸，并提供按退付次序查询记录的接口；"
+        "同单号同账户同金额重试返回首次回执，换账户或金额返回 409；"
+        "信用核对与退付登记和原入账、收款共用同一 SQLite 写事务，"
+        "并发不重复支付，重启后记录仍可查。"
     ),
-    version="1.9.0",
+    version="1.10.0",
 )
 
 
@@ -175,6 +188,17 @@ async def ledger_error_handler(request: Request, exc: LedgerError):
 async def payment_error_handler(request: Request, exc: PaymentError):
     body = {"error": exc.code, "reason": str(exc)}
     # 附加字段（如冲突单号的已登记账户/金额、超额时的当前尚欠/信用）随错误体顶层返回
+    body.update(exc.extra)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=body,
+    )
+
+
+@app.exception_handler(PayoutError)
+async def payout_error_handler(request: Request, exc: PayoutError):
+    body = {"error": exc.code, "reason": str(exc)}
+    # 附加字段（如冲突单号的已登记账户/金额、超额时的当前信用/尚欠）随错误体顶层返回
     body.update(exc.extra)
     return JSONResponse(
         status_code=exc.status_code,
@@ -569,3 +593,63 @@ async def list_account_payments(account_id: str) -> PaymentListResponse:
     """
     result = list_payments(account_id)
     return PaymentListResponse.model_validate(result)
+
+
+# ---------------------------------------------------------------------------
+# 账户信用退付：应退抵减未付凭证后剩余的信用按单实际退付
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/accounts/{account_id}/payouts",
+    response_model=PayoutReceiptResponse,
+    responses={
+        409: {"model": ErrorResponse, "description": "退付单号已用于别的账户或别的金额"},
+        422: {"model": ErrorResponse, "description": "金额非正、账户无台账或退付超过当前信用（整笔拒绝不留记录）"},
+    },
+    tags=["ledger"],
+)
+async def post_account_payout(account_id: str, req: PayoutRequest) -> PayoutReceiptResponse:
+    """按账户退付一笔信用（应退抵减未付凭证后剩余的部分）。
+
+    - 可退付上限为当前信用 credit_yuan：账户全部已记应退先扣除已落盘退付，
+      再按原入账顺序抵减尚未付清的正额凭证后的剩余；退付金额超过当前信用
+      → 422 payout_exceeds_credit，错误体附当前信用/尚欠，**整笔拒绝、
+      不登记退付单、不留任何记录**；金额必须为正；
+    - 退付后台账与收款查询的当前信用同步扣除已付退款；退付本身不改变
+      任何凭证的尚欠与已收款；后续入账的应补/应退仍按原规则（应退池
+      扣除已退付后 FIFO 抵减）改变最新尚欠/信用，已记凭证、收款分配
+      与各首次回执保持原样；
+    - 同一 payout_no + 同账户 + 同金额重试 → result=deduped，返回首次
+      成功时冻结的回执（金额、退付时间与当时头寸快照都不漂移）；同一
+      单号换金额或跨账户使用 → 409 payout_no_conflict，错误体附已登记
+      的 account_id / amount_yuan，不写入；
+    - 信用核对与退付落盘和原入账、收款共用同一 SQLite 写事务
+      （RLock + BEGIN IMMEDIATE），payout_no 主键兜底：并发同单号只有
+      一笔落盘、并发不同单号不会超额退付，进程重启后记录仍在、不会
+      重复支付。
+    """
+    result = submit_payout(
+        account_id=account_id,
+        payout_no=req.payout_no,
+        amount_yuan=req.amount_yuan,
+    )
+    return PayoutReceiptResponse.model_validate(result)
+
+
+@app.get(
+    "/accounts/{account_id}/payouts",
+    response_model=PayoutListResponse,
+    tags=["ledger"],
+)
+async def list_account_payouts(account_id: str) -> PayoutListResponse:
+    """按退付次序（payout_seq 升序）查询账户全部退付记录与当前最新头寸。
+
+    每条记录均为首次成功时冻结的回执（退付金额、退付时间与当时头寸快照）；
+    账户级 total_paid_out_yuan 为当前累计退付，outstanding_yuan /
+    credit_yuan 为按当前全部凭证、已落盘核销与已落盘退付重算的最新值
+    （后续补退会改变它们，但不改写任何历史退付记录）。从未入账也无退付
+    的账户返回全 0/空。
+    """
+    result = list_payouts(account_id)
+    return PayoutListResponse.model_validate(result)

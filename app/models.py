@@ -1061,3 +1061,93 @@ class PaymentListResponse(BaseModel):
     payments: List[PaymentListItem] = Field(
         description="全部收款记录，按收款次序（payment_seq 升序）；内容为首次冻结值"
     )
+
+
+# ---------------------------------------------------------------------------
+# 账户信用退付：唯一退付单号 + 正金额，只能支付应退抵减后剩余的信用
+# ---------------------------------------------------------------------------
+
+MAX_PAYOUT_NO_LEN = 128
+
+
+class PayoutRequest(BaseModel):
+    """按账户退付一笔信用：全平台唯一退付单号与正金额。
+
+    账户 ID 由路径 /accounts/{account_id}/payouts 给出。
+    """
+
+    payout_no: str = Field(
+        min_length=1,
+        max_length=MAX_PAYOUT_NO_LEN,
+        description="调用方退付单号（全平台唯一）：同号 + 同账户 + 同金额重试返回"
+        "首次回执；同号换金额或跨账户使用返回 409 冲突",
+    )
+    amount_yuan: float = Field(
+        gt=0.0,
+        description="退付金额（元，必须为正且有限）；超过当前信用整笔拒绝、不留记录",
+    )
+
+
+class PayoutReceiptResponse(BaseModel):
+    """一笔退付的登记回执：首次 result=paid，原样重试 result=deduped。
+
+    重试返回的始终是首次成功时冻结的内容（退付金额、退付时间与当时头寸
+    快照），即使后来又入账新的应补/应退凭证也不漂移。
+    """
+
+    account_id: str
+    payout_no: str
+    result: Literal["paid", "deduped"] = Field(
+        description="paid=本次新退付并原子落盘；deduped=同号同账户同金额重试，"
+        "原样返回首次回执"
+    )
+    amount_yuan: float = Field(description="本次退付金额（正）")
+    paid_at: str = Field(description="首次退付时间（UTC ISO 8601，重试不漂移）")
+    total_paid_out_yuan: float = Field(
+        description="本次退付后账户累计已退付（含本笔）；重试时为首次退付当时的快照"
+    )
+    outstanding_yuan: float = Field(
+        description="本次退付后的最新尚欠（退付只消耗信用，不改变逐凭证尚欠，≥0）"
+    )
+    credit_yuan: float = Field(
+        description="本次退付后的账户信用（应退抵减并扣除已付退付后的剩余，≥0）"
+    )
+    payout_count: int = Field(description="本次退付后账户累计退付笔数（含本笔）")
+
+
+class PayoutListItem(BaseModel):
+    """退付记录列表中的一条：落盘时冻结的首次回执（列表中 result 恒为 paid）。"""
+
+    account_id: str
+    payout_no: str
+    result: Literal["paid"] = Field(
+        description="列表只反映落盘事实：每条都是首次成功的退付；"
+        "是否重试请在提交接口看 result=deduped"
+    )
+    amount_yuan: float
+    paid_at: str
+    total_paid_out_yuan: float = Field(
+        description="该笔退付当时的账户累计退付快照（后续退付不回改）"
+    )
+    outstanding_yuan: float = Field(description="该笔退付当时的尚欠快照")
+    credit_yuan: float = Field(description="该笔退付当时的信用快照")
+    payout_count: int = Field(description="该笔在账户内的退付序号（1 起）")
+
+
+class PayoutListResponse(BaseModel):
+    """按退付次序查询账户全部退付记录与当前最新尚欠/信用。"""
+
+    account_id: str
+    payout_count: int = Field(description="账户累计退付笔数")
+    total_paid_out_yuan: float = Field(
+        description="当前账户累计已退付（全部退付金额之和，随新增退付增长）"
+    )
+    outstanding_yuan: float = Field(
+        description="当前最新尚欠（随后续入账的应补/应退凭证变化；退付不改旧分配）"
+    )
+    credit_yuan: float = Field(
+        description="当前账户信用（已扣除全部已付退付；允许为正）"
+    )
+    payouts: List[PayoutListItem] = Field(
+        description="全部退付记录，按退付次序（payout_seq 升序）；内容为首次冻结值"
+    )

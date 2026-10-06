@@ -27,14 +27,18 @@
 
 当前尚欠 / 信用重算（对账户全部已记明细）：
 - 先把账户内**全部已记应退**（无论其入账在正额凭证之前还是之后）汇成一个
-  应退池，再按原入账顺序（entry_no 升序）逐张处理正额凭证：
+  应退池，并**先扣除全部已落盘退付**（退付只动信用、不动逐凭证核销），
+  再按原入账顺序（entry_no 升序）逐张处理正额凭证：
   每张正额凭证上，已落盘收款核销（现金）先受保护，池子只抵减
   「应收 − 已收款」的未核销部分（applied = min(剩余池, 应收 − 已收款)），
   抵减后其余额即该凭证最新尚欠；
 - 遍历结束后池中剩余即账户信用 credit_yuan；
   全部正额凭证尚欠之和即 outstanding_yuan（与信用不同时为正）。
-这套「当前重算」只读取冻结的现金核销，从不改写它们：后来补退只会增大池子、
-改变最新尚欠/信用（现金已付清的凭证直接被池子越过），旧收款分配原样保留。
+这套「当前重算」只读取冻结的现金核销与已落盘退付，从不改写它们：后来补退
+只会增大池子、改变最新尚欠/信用（现金已付清的凭证直接被池子越过），
+旧收款分配与旧退付回执原样保留。退付在池中最先扣除：退付时刻已核验
+「退付 ≤ 当时信用」，故池不会为负，且退付本身不改变任何凭证的尚欠；
+之后入账的应补/应退仍按同一口径与已扣退付的池子重新抵减。
 
 HTTP 错误码：
 - payment_empty_account：账户尚无已入账凭证，没有可登记的应收（422）；
@@ -89,24 +93,32 @@ def account_position(conn, store: SessionStore, account_id: str) -> dict:
     """在给定连接上重算账户当前头寸：逐凭证尚欠、账户尚欠与信用、累计实收。
 
     应退抵减与凭证入账先后无关：账户内**全部已记应退**（billing=refund）汇成
-    一个应退池，按原入账顺序（entry_no 升序）逐张抵减正额凭证
+    一个应退池，**先扣除全部已落盘退付**（退付只消耗信用，不产生逐凭证核销），
+    再按原入账顺序（entry_no 升序）逐张抵减正额凭证
     （full/supplement）**尚未被收款核销的部分**：
       每张正额凭证上 applied = min(剩余应退池, 应收 − 已落盘收款核销)，
     抵减后剩余为该凭证最新尚欠；遍历结束后池中剩余即账户信用。
     已落盘的收款核销（现金）优先于应退池受保护：后来补退最多抵掉「应收 −
     已收款」，旧收款分配永不被改写；no_adjustment 为 0 元明细，不参与。
     返回 entries（与 ledger 明细同序，附 receivable/refund_applied/paid/
-    outstanding）与账户级 totals（含 total_received_yuan 累计实收）。
+    outstanding）与账户级 totals（含 total_received_yuan 累计实收与
+    total_paid_out_yuan 累计退付）。
     """
     rows = store.list_ledger_entry_rows_in_txn(conn, account_id)
-    # 应退池按账户整体汇总（与入账先后无关），再按 FIFO 抵减正额凭证。
+    # 应退池按账户整体汇总（与入账先后无关），先扣除已落盘退付，再按 FIFO
+    # 抵减正额凭证。退付落盘时已核验「退付 ≤ 当时信用」，池不会为负；
+    # 浮点尘埃兜底归零。
+    total_paid_out = _round6(store.sum_payouts(conn, account_id))
     refund_pool = _round6(
         sum(
             abs(float(r["signed_amount_yuan"]))
             for r in rows
             if float(r["signed_amount_yuan"]) < -_EPS
         )
+        - total_paid_out
     )
+    if refund_pool < _EPS:
+        refund_pool = 0.0
     total_received = 0.0
     entries: List[dict] = []
 
@@ -157,6 +169,7 @@ def account_position(conn, store: SessionStore, account_id: str) -> dict:
         "outstanding_yuan": total_outstanding,
         "credit_yuan": credit,
         "total_received_yuan": total_received,
+        "total_paid_out_yuan": total_paid_out,
         "entry_count": len(entries),
     }
     return {"account_id": account_id, "entries": entries, "totals": totals}

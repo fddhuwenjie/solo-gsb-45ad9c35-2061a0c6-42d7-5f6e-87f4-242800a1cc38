@@ -35,11 +35,17 @@
   account_payment_allocations 记录每笔收款按原入账顺序对正额凭证的逐笔
   核销（含部分付清），同一写事务内与收款主行一起落盘，使「当前尚欠」
   可由已入账凭证与已落盘核销重算；超额收款整笔拒绝时两表都不写。
+- account_payouts 为账户信用退付：payout_no 为调用方提交的全平台唯一
+  退付单号（主键），整行冻结首次成功时的完整回执 JSON（退付金额、
+  退付时间与当时头寸快照）；同一单号 + 同账户 + 同金额重试原样取回
+  首次回执，单号换金额或跨账户复用判 409；(account_id, payout_seq)
+  唯一键保证账户内退付次序连续。已落盘退付在头寸重算时从应退池中
+  扣除（只动信用、不动逐凭证核销），信用不足时整笔拒绝、本表不写。
 - 旧库只有 sessions / session_records 两张表时，session_batches、
   session_revisions、session_settlement_vouchers、account_ledger_entries、
-  account_payments 与 account_payment_allocations 由 CREATE TABLE IF NOT
-  EXISTS 自动补齐（空表）：查询与从 next_index 续报不受影响；已确认区间
-  内没有批次边界可核对，不按前缀猜测去重。
+  account_payments、account_payment_allocations 与 account_payouts 由
+  CREATE TABLE IF NOT EXISTS 自动补齐（空表）：查询与从 next_index 续报
+  不受影响；已确认区间内没有批次边界可核对，不按前缀猜测去重。
 """
 
 from __future__ import annotations
@@ -54,7 +60,8 @@ from typing import Iterator, List, Optional
 # session_batches 为批次边界与首收回执表；session_revisions 为计量表更正表
 # （存每次提交的原始变更与叠加后的整段修订台账）；session_settlement_vouchers
 # 为逐版结算凭证表（冻结该版台账、完整结算结果与首单/补退计费），均为后加的
-# 新表，旧库打开时由 IF NOT EXISTS 自动补建。
+# 新表，旧库打开时由 IF NOT EXISTS 自动补建。account_payouts 为信用退付表，
+# 同样由 IF NOT EXISTS 自动补建。
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
@@ -160,6 +167,19 @@ CREATE TABLE IF NOT EXISTS account_payment_allocations (
 );
 CREATE INDEX IF NOT EXISTS idx_allocations_voucher
     ON account_payment_allocations(account_id, session_id, voucher_no);
+CREATE TABLE IF NOT EXISTS account_payouts (
+    payout_id TEXT NOT NULL,
+    payout_no TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    payout_seq INTEGER NOT NULL,
+    amount_yuan REAL NOT NULL,
+    receipt_json TEXT NOT NULL,
+    paid_at TEXT NOT NULL,
+    PRIMARY KEY (payout_no),
+    UNIQUE (account_id, payout_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_payouts_account_order
+    ON account_payouts(account_id, payout_seq);
 """
 
 # 台账表后加列时的轻量迁移：旧库已建表但缺列，按列名幂等 ALTER 补齐。
@@ -731,6 +751,75 @@ class SessionStore:
             (account_id, session_id, voucher_no),
         ).fetchone()
         return float(row["s"])
+
+    # ------------------------------------------------------------------
+    # 账户信用退付（退付单幂等，已付退付从头寸重算的应退池中扣除）
+    # ------------------------------------------------------------------
+
+    def get_payout(self, conn: sqlite3.Connection, payout_no: str) -> Optional[sqlite3.Row]:
+        """写事务内按全平台唯一退付单号取退付行；从未提交过返回 None。"""
+        return conn.execute(
+            "SELECT * FROM account_payouts WHERE payout_no = ?",
+            (payout_no,),
+        ).fetchone()
+
+    def count_payouts(self, conn: sqlite3.Connection, account_id: str) -> int:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM account_payouts WHERE account_id = ?",
+            (account_id,),
+        ).fetchone()
+        return int(row["c"])
+
+    def sum_payouts(self, conn: sqlite3.Connection, account_id: str) -> float:
+        """写事务内汇总账户全部已落盘退付金额（头寸重算时从应退池扣除）。"""
+        row = conn.execute(
+            "SELECT COALESCE(SUM(amount_yuan), 0.0) AS s FROM account_payouts"
+            " WHERE account_id = ?",
+            (account_id,),
+        ).fetchone()
+        return float(row["s"])
+
+    def insert_payout(
+        self,
+        conn: sqlite3.Connection,
+        payout_id: str,
+        payout_no: str,
+        account_id: str,
+        payout_seq: int,
+        amount_yuan: float,
+        receipt_json: str,
+        paid_at: str,
+    ) -> None:
+        """与「信用核对」同一事务原子落盘退付主行（含冻结回执）。
+
+        payout_no 主键在数据库层兜底：并发同单号只有一笔成功落盘。
+        """
+        conn.execute(
+            "INSERT INTO account_payouts"
+            "(payout_id, payout_no, account_id, payout_seq, amount_yuan,"
+            " receipt_json, paid_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                payout_id,
+                payout_no,
+                account_id,
+                payout_seq,
+                amount_yuan,
+                receipt_json,
+                paid_at,
+            ),
+        )
+
+    def list_payout_rows(self, account_id: str) -> List[sqlite3.Row]:
+        """按退付次序（payout_seq 升序）列出账户全部已落盘退付行。"""
+        with self._lock, self._connect() as conn:
+            return list(
+                conn.execute(
+                    "SELECT * FROM account_payouts"
+                    " WHERE account_id = ? ORDER BY payout_seq",
+                    (account_id,),
+                ).fetchall()
+            )
 
 
 _store: Optional[SessionStore] = None
